@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -265,7 +266,14 @@ class CLIPEncoder(nn.Module):
             # scripted_model = torch.load('data/ViT-B-'+str(patch_size)+'.pt')
             # state_dict = scripted_model.state_dict()
             # self.model.load_state_dict(state_dict)
-            self.model.load_state_dict(torch.load('/data/ViT-B-'+str(patch_size)+'.pt', map_location = torch.device('cpu')).state_dict(),strict=False)
+            vit_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+                'data',
+                'ViT-B-' + str(patch_size) + '.pt',
+            )
+            ckpt = torch.load(vit_path, map_location=torch.device('cpu'))
+            state_dict = ckpt.state_dict() if hasattr(ckpt, 'state_dict') else ckpt
+            self.model.load_state_dict(state_dict, strict=False)
             self.model = self.model.to('cuda')  # transfer to GPU 
         elif patch_size == 32:
             self.model.load_state_dict(torch.jit.load('data/ViT-B-'+str(patch_size)+'.pt', map_location = torch.device('cpu')).state_dict(),strict=False)

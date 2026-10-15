@@ -1,0 +1,9 @@
+datasets
+pretrained
+log
+*/checkpoints/*
+*.pt
+data/
+vlnce_baselines/
+scene_datasets
+

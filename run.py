@@ -15,7 +15,8 @@ from vlnce_baselines.config.default import get_config
 #     evaluate_agent,
 #     nonlearning_inference,
 # )
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
 def main():

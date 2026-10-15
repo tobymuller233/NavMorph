@@ -25,7 +25,9 @@ def extract_instruction_tokens(
             token = observations[i][instruction_sensor_uuid]["tokens"][:max_length]
             if len(token) < max_length:
                 token += [pad_id] * (max_length - len(token))
-            observations[i][instruction_sensor_uuid] = token
+            observations[i][instruction_sensor_uuid] = np.array(
+                token, dtype=np.int64
+            )
         else:
             break
     return observations
