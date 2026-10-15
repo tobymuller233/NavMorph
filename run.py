@@ -11,6 +11,11 @@ from habitat_baselines.common.baseline_registry import baseline_registry
 import habitat_extensions  # noqa: F401
 import vlnce_baselines  # noqa: F401
 from vlnce_baselines.config.default import get_config
+from vlnce_baselines.common.distributed_utils import (
+    is_main_process,
+    resolve_local_rank,
+    setup_distributed,
+)
 # from vlnce_baselines.nonlearning_agents import (
 #     evaluate_agent,
 #     nonlearning_inference,
@@ -75,6 +80,8 @@ def run_exp(exp_name: str, exp_config: str,
     Returns:
         None.
     """
+    local_rank = resolve_local_rank(local_rank)
+
     config = get_config(exp_config, opts)
     config.defrost()
 
@@ -100,13 +107,20 @@ def run_exp(exp_name: str, exp_config: str,
     config.image_size = image_size
     config.imagine_T = imagine_T
 
-    config.freeze()
-    os.system("mkdir -p data/logs/running_log")
-    logger.add_filehandler('data/logs/running_log/'+config.LOG_FILE)
+    setup_distributed(config)
 
-    random.seed(config.TASK_CONFIG.SEED)
-    np.random.seed(config.TASK_CONFIG.SEED)
-    torch.manual_seed(config.TASK_CONFIG.SEED)
+    config.defrost()
+    config.TASK_CONFIG.SEED += config.local_rank
+    config.freeze()
+
+    os.system("mkdir -p data/logs/running_log")
+    if is_main_process():
+        logger.add_filehandler('data/logs/running_log/'+config.LOG_FILE)
+
+    seed = config.TASK_CONFIG.SEED
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = False
     if torch.cuda.is_available():

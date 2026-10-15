@@ -24,6 +24,10 @@ from habitat_baselines.utils.common import batch_obs
 from vlnce_baselines.common.aux_losses import AuxLosses
 from vlnce_baselines.common.base_il_trainer import BaseVLNCETrainer
 from vlnce_baselines.common.env_utils import construct_envs, is_slurm_batch_job
+from vlnce_baselines.common.distributed_utils import (
+    bind_trainer_device,
+    simulator_gpu_id_for_rank,
+)
 from vlnce_baselines.common.utils import extract_instruction_tokens, get_camera_orientations12
 
 with warnings.catch_warnings():
@@ -470,7 +474,7 @@ class DaggerTrainer(BaseVLNCETrainer):
         if self.config.IL.DAGGER.expert_policy_sensor not in self.config.TASK_CONFIG.TASK.SENSORS:
             self.config.TASK_CONFIG.TASK.SENSORS.append(self.config.IL.DAGGER.expert_policy_sensor)
         self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
-        self.config.SIMULATOR_GPU_IDS = self.config.SIMULATOR_GPU_IDS[self.config.local_rank]
+        self.config.SIMULATOR_GPU_IDS = simulator_gpu_id_for_rank(self.config)
         self.config.use_pbar = not is_slurm_batch_job()
         ''' if choosing image '''
         resize_config = self.config.RL.POLICY.OBS_TRANSFORMS.RESIZER_PER_SENSOR.SIZES
@@ -499,20 +503,9 @@ class DaggerTrainer(BaseVLNCETrainer):
         self.world_size = self.config.GPU_NUMBERS
         self.local_rank = self.config.local_rank
         self.batch_size = self.config.IL.batch_size
-        torch.cuda.set_device(self.device)
-        if self.world_size > 1:
-            distr.init_process_group(backend='nccl', init_method='env://')
-            self.device = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.defrost()
-            self.config.TORCH_GPU_ID = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.freeze()
-            torch.cuda.set_device(self.device)
+        self.device = bind_trainer_device(self.config)
 
     def _init_envs(self):
-        # for DDP to load different data
-        self.config.defrost()
-        self.config.TASK_CONFIG.SEED = self.config.TASK_CONFIG.SEED + self.local_rank
-        self.config.freeze()
 
         self.envs = construct_envs(
             self.config, 

@@ -43,6 +43,11 @@ from vlnce_baselines.common.env_utils import (
     construct_envs,
     is_slurm_batch_job,
 )
+from vlnce_baselines.common.distributed_utils import (
+    bind_trainer_device,
+    destroy_process_group,
+    simulator_gpu_id_for_rank,
+)
 from vlnce_baselines.common.utils import *
 
 from habitat_extensions.measures import NDTW
@@ -803,7 +808,7 @@ class BaseVLNCETrainer(BaseILTrainer):
         self.config.defrost()
         self.config.TASK_CONFIG.DATASET.ROLES = ["guide"]
         self.config.TASK_CONFIG.TASK.MEASUREMENTS = ['POSITION', 'STEPS_TAKEN', 'COLLISIONS']
-        self.config.SIMULATOR_GPU_IDS = [self.config.SIMULATOR_GPU_IDS[self.config.local_rank]]
+        self.config.SIMULATOR_GPU_IDS = simulator_gpu_id_for_rank(self.config)
 
         if 'HIGHTOLOW' in self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS:
             idx = self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS.index('HIGHTOLOW')
@@ -843,14 +848,7 @@ class BaseVLNCETrainer(BaseILTrainer):
         self.config.SENSORS = config.SIMULATOR.AGENT_0.SENSORS
         
         self.config.freeze()
-        torch.cuda.set_device(self.device)
-        if world_size > 1:
-            distr.init_process_group(backend='nccl', init_method='env://')
-            self.device = self.config.TORCH_GPU_IDS[self.local_rank]
-            torch.cuda.set_device(self.device)
-            self.config.defrost()
-            self.config.TORCH_GPU_ID = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.freeze()
+        self.device = bind_trainer_device(self.config)
         self.traj = self.collect_val_traj()
         
         with TensorboardWriter(
@@ -889,6 +887,8 @@ class BaseVLNCETrainer(BaseILTrainer):
                         checkpoint_index=self.get_ckpt_id(current_ckpt),
                     )
 
+        destroy_process_group()
+
     def get_ckpt_id(self, ckpt_path):
         ckpt_path = os.path.basename(ckpt_path)
         ckpt_id = ckpt_path.split('.')[1].replace('iter', '')
@@ -919,7 +919,7 @@ class BaseVLNCETrainer(BaseILTrainer):
             s for s in self.config.TASK_CONFIG.TASK.SENSORS if "INSTRUCTION" in s
         ]
         ########### Additional Config ###########
-        self.config.SIMULATOR_GPU_IDS = [self.config.SIMULATOR_GPU_IDS[self.config.local_rank]]
+        self.config.SIMULATOR_GPU_IDS = simulator_gpu_id_for_rank(self.config)
         if 'HIGHTOLOW' in self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS:
             idx = self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS.index('HIGHTOLOW')
             self.config.TASK_CONFIG.TASK.POSSIBLE_ACTIONS[idx] = 'HIGHTOLOWINFERENCE'

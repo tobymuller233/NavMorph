@@ -36,6 +36,14 @@ from habitat.tasks.utils import cartesian_to_polar
 from vlnce_baselines.common.aux_losses import AuxLosses
 from vlnce_baselines.common.base_il_trainer import BaseVLNCETrainer
 from vlnce_baselines.common.env_utils import construct_envs, construct_envs_for_rl, is_slurm_batch_job
+from vlnce_baselines.common.distributed_utils import (
+    bind_trainer_device,
+    destroy_process_group,
+    is_main_process,
+    simulator_gpu_id_for_rank,
+    state_dict_for_save,
+    unwrap_module,
+)
 from vlnce_baselines.common.utils import extract_instruction_tokens
 from vlnce_baselines.models.graph_utils import GraphMap, MAX_DIST, calculate_vp_rel_pos_fts
 from vlnce_baselines.utils import reduce_loss
@@ -97,7 +105,7 @@ class RLTrainer(BaseVLNCETrainer):
         self.prompt_alpha = config.prompt_alpha
         self.neighbor = config.neighbor
         self.image_size = config.image_size
-        self.prompt = Prompt(prompt_alpha=self.prompt_alpha, image_size=self.image_size).to(self.device)
+        self.prompt = Prompt(prompt_alpha=self.prompt_alpha, image_size=self.image_size)
         # self.memory_bank = Memory(size=config.memory_size, dimension=self.prompt.data_prompt.numel())
         self.memory_vft_pos = Memory_vft(size=config.memory_size, dimension=1*1536)
         self.imagine_T = config.imagine_T
@@ -113,9 +121,11 @@ class RLTrainer(BaseVLNCETrainer):
                 self._make_results_dir()
 
     def save_checkpoint(self, iteration: int):
+        if not is_main_process():
+            return
         torch.save(
             obj={
-                "state_dict": self.policy.state_dict(),
+                "state_dict": state_dict_for_save(self.policy),
                 "optim_state": self.optimizer.state_dict(),
                 "iteration": iteration,
             },
@@ -128,7 +138,7 @@ class RLTrainer(BaseVLNCETrainer):
         self.config.TASK_CONFIG.TASK.NDTW.SPLIT = self.split
         self.config.TASK_CONFIG.TASK.SDTW.SPLIT = self.split
         self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
-        self.config.SIMULATOR_GPU_IDS = self.config.SIMULATOR_GPU_IDS[self.config.local_rank]
+        self.config.SIMULATOR_GPU_IDS = simulator_gpu_id_for_rank(self.config)
         self.config.use_pbar = not is_slurm_batch_job()
         ''' if choosing image '''
         resize_config = self.config.RL.POLICY.OBS_TRANSFORMS.RESIZER_PER_SENSOR.SIZES
@@ -187,20 +197,10 @@ class RLTrainer(BaseVLNCETrainer):
         self.world_size = self.config.GPU_NUMBERS
         self.local_rank = self.config.local_rank
         self.batch_size = self.config.IL.batch_size
-        
-        torch.cuda.set_device(self.device)
-        if self.world_size > 1:
-            distr.init_process_group(backend='nccl', init_method='env://',timeout=datetime.timedelta(seconds=7200000))
-            self.device = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.defrost()
-            self.config.TORCH_GPU_ID = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.freeze()
+        self.device = bind_trainer_device(self.config)
+        self.prompt = self.prompt.to(self.device)
 
     def _init_envs(self):
-        # for DDP to load different data
-        self.config.defrost()
-        self.config.TASK_CONFIG.SEED = self.config.TASK_CONFIG.SEED + self.local_rank
-        self.config.freeze()
 
         self.envs = construct_envs(
             self.config, 
@@ -241,15 +241,22 @@ class RLTrainer(BaseVLNCETrainer):
         self.img_segmentor = get_img_segmentor_from_options(n_object_classes,1.0)
         self.img_segmentor = self.img_segmentor.to(self.device)
 
-        if self.config.GPU_NUMBERS > 1:
-            self.img_segmentor = DDP(self.img_segmentor,device_ids=[self.device], output_device=self.device)
-        else:
+        if self.config.GPU_NUMBERS == 1:
             self.img_segmentor = torch.nn.DataParallel(self.img_segmentor)
 
         _repo_root = os.path.dirname(os.path.dirname(__file__))
         _pretrained_root = os.path.join(_repo_root, "pretrained")
         checkpoint = torch.load(os.path.join(_pretrained_root, "segm.pt"))
-        self.img_segmentor.load_state_dict(checkpoint['models']['img_segm_model'])         
+        segm_state = checkpoint["models"]["img_segm_model"]
+        if isinstance(self.img_segmentor, torch.nn.DataParallel):
+            if not any(k.startswith("module.") for k in segm_state):
+                segm_state = {"module." + k: v for k, v in segm_state.items()}
+        elif any(k.startswith("module.") for k in segm_state):
+            segm_state = {
+                k[len("module.") :] if k.startswith("module.") else k: v
+                for k, v in segm_state.items()
+            }
+        self.img_segmentor.load_state_dict(segm_state)
         self.img_segmentor.eval()
 
         self.policy.net.occupancy_map_predictor = ResNetUNet(3,3,True)
@@ -278,13 +285,22 @@ class RLTrainer(BaseVLNCETrainer):
         self.policy.to(self.device)
 
         if self.config.GPU_NUMBERS > 1:
-            print('Using', self.config.GPU_NUMBERS,'GPU!')
-            # find_unused_parameters=False fix ddp bug
-            self.policy.net = DDP(self.policy.net.to(self.device), device_ids=[self.device],
-                output_device=self.device, find_unused_parameters=True, broadcast_buffers=False)
-        else:
-            self.policy.net = torch.nn.DataParallel(self.policy.net.to(self.device),
-                device_ids=[self.device], output_device=self.device)
+            print('Using', self.config.GPU_NUMBERS, 'GPU!')
+            gpu_id = int(self.config.TORCH_GPU_ID)
+            policy_net = unwrap_module(self.policy.net)
+            policy_net.vln_bert = DDP(
+                policy_net.vln_bert.to(self.device),
+                device_ids=[gpu_id],
+                output_device=gpu_id,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+        elif self.config.GPU_NUMBERS == 1:
+            self.policy.net = torch.nn.DataParallel(
+                self.policy.net.to(self.device),
+                device_ids=[int(self.config.TORCH_GPU_ID)],
+                output_device=int(self.config.TORCH_GPU_ID),
+            )
 
         self.optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.policy.parameters()), lr=self.config.IL.lr)
 
@@ -406,7 +422,7 @@ class RLTrainer(BaseVLNCETrainer):
                 else:
                     raise NotImplementedError
        
-        return torch.tensor(teacher_actions).cuda()
+        return torch.tensor(teacher_actions).to(self.device)
 
 
 
@@ -433,9 +449,9 @@ class RLTrainer(BaseVLNCETrainer):
             batch_view_lens.append(len(nav_types))
         # collate
         batch_rgb_fts = pad_tensors_wgrad(batch_rgb_fts)
-        batch_loc_fts = pad_tensors_wgrad(batch_loc_fts).cuda()
-        batch_nav_types = pad_sequence(batch_nav_types, batch_first=True).cuda()
-        batch_view_lens = torch.LongTensor(batch_view_lens).cuda()
+        batch_loc_fts = pad_tensors_wgrad(batch_loc_fts).to(self.device)
+        batch_nav_types = pad_sequence(batch_nav_types, batch_first=True).to(self.device)
+        batch_view_lens = torch.LongTensor(batch_view_lens).to(self.device)
 
         return {
             'rgb_fts': batch_rgb_fts, 'loc_fts': batch_loc_fts,
@@ -497,19 +513,19 @@ class RLTrainer(BaseVLNCETrainer):
             batch_gmap_visited_masks.append(torch.BoolTensor(gmap_visited_masks))
         
         # collate
-        batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).cuda()
+        batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).to(self.device)
         batch_gmap_img_fts = pad_tensors_wgrad(batch_gmap_img_fts)
-        batch_gmap_pos_fts = pad_tensors_wgrad(batch_gmap_pos_fts).cuda()
+        batch_gmap_pos_fts = pad_tensors_wgrad(batch_gmap_pos_fts).to(self.device)
         batch_gmap_lens = torch.LongTensor(batch_gmap_lens)
-        batch_gmap_masks = gen_seq_masks(batch_gmap_lens).cuda()
-        batch_gmap_visited_masks = pad_sequence(batch_gmap_visited_masks, batch_first=True).cuda()
+        batch_gmap_masks = gen_seq_masks(batch_gmap_lens).to(self.device)
+        batch_gmap_visited_masks = pad_sequence(batch_gmap_visited_masks, batch_first=True).to(self.device)
 
         bs = len(cur_vp)
         max_gmap_len = max(batch_gmap_lens)
         gmap_pair_dists = torch.zeros(bs, max_gmap_len, max_gmap_len).float()
         for i in range(bs):
             gmap_pair_dists[i, :batch_gmap_lens[i], :batch_gmap_lens[i]] = batch_gmap_pair_dists[i]
-        gmap_pair_dists = gmap_pair_dists.cuda()
+        gmap_pair_dists = gmap_pair_dists.to(self.device)
 
         return {
             'gmap_vp_ids': batch_gmap_vp_ids, 'gmap_step_ids': batch_gmap_step_ids,
@@ -521,9 +537,9 @@ class RLTrainer(BaseVLNCETrainer):
 
     def _history_variable(self, obs):
         batch_size = obs['pano_rgb'].shape[0]
-        hist_rgb_fts = obs['pano_rgb'][:, 0, ...].cuda()
-        hist_pano_rgb_fts = obs['pano_rgb'].cuda()
-        hist_pano_ang_fts = obs['pano_angle_fts'].unsqueeze(0).expand(batch_size, -1, -1).cuda()
+        hist_rgb_fts = obs['pano_rgb'][:, 0, ...].to(self.device)
+        hist_pano_rgb_fts = obs['pano_rgb'].to(self.device)
+        hist_pano_ang_fts = obs['pano_angle_fts'].unsqueeze(0).expand(batch_size, -1, -1).to(self.device)
 
         return hist_rgb_fts, hist_pano_rgb_fts, hist_pano_ang_fts
 
@@ -595,16 +611,17 @@ class RLTrainer(BaseVLNCETrainer):
                 os.makedirs(vp_folder, exist_ok=True)
                 self.memory_vft_pos.save_memory(vp_path)
 
-        
+        destroy_process_group()
+
     def _train_interval(self, interval, ml_weight, sample_ratio):
         
         self.policy.eval()
-        self.policy.net.module.vln_bert.train()
+        unwrap_module(self.policy.net).vln_bert.train()
 
         # Freeze all model parameters, except for those in the vln_bert module
         for param in self.policy.parameters():
             param.requires_grad = False
-        for param in self.policy.net.module.vln_bert.parameters():
+        for param in unwrap_module(self.policy.net).vln_bert.parameters():
             param.requires_grad = True
         
         # for name, param in self.policy.named_parameters():
@@ -619,7 +636,7 @@ class RLTrainer(BaseVLNCETrainer):
         for idx in pbar:
             self.optimizer.zero_grad()
             # self.loss = 0.
-            self.loss = torch.tensor(0.0, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu')
+            self.loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
 
             with autocast():
                 self.rollout('train', ml_weight, sample_ratio)
@@ -727,7 +744,7 @@ class RLTrainer(BaseVLNCETrainer):
             aggregated_states[stat_key] = (
                 sum(v[stat_key] for v in self.stat_eps.values()) / num_episodes
             )
-        total = torch.tensor(num_episodes).cuda()
+        total = torch.tensor(num_episodes, device=self.device)
         if self.world_size > 1:
             distr.reduce(total,dst=0)
         total = total.item()
@@ -735,7 +752,7 @@ class RLTrainer(BaseVLNCETrainer):
         if self.world_size > 1:
             logger.info(f"rank {self.local_rank}'s {num_episodes}-episode results: {aggregated_states}")
             for k,v in aggregated_states.items():
-                v = torch.tensor(v*num_episodes).cuda()
+                v = torch.tensor(v * num_episodes, device=self.device)
                 cat_v = gather_list_and_concat(v,self.world_size)
                 v = (sum(cat_v)/total).item()
                 aggregated_states[k] = v
@@ -776,7 +793,7 @@ class RLTrainer(BaseVLNCETrainer):
         self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
         self.config.TASK_CONFIG.TASK.MEASUREMENTS = ['POSITION_INFER']
         self.config.TASK_CONFIG.TASK.SENSORS = [s for s in self.config.TASK_CONFIG.TASK.SENSORS if "INSTRUCTION" in s]
-        self.config.SIMULATOR_GPU_IDS = [self.config.SIMULATOR_GPU_IDS[self.config.local_rank]]
+        self.config.SIMULATOR_GPU_IDS = simulator_gpu_id_for_rank(self.config)
         # if choosing image
         resize_config = self.config.RL.POLICY.OBS_TRANSFORMS.RESIZER_PER_SENSOR.SIZES
         crop_config = self.config.RL.POLICY.OBS_TRANSFORMS.CENTER_CROPPER_PER_SENSOR.SENSOR_CROPS
@@ -800,16 +817,11 @@ class RLTrainer(BaseVLNCETrainer):
         self.config.TASK_CONFIG = task_config
         self.config.SENSORS = task_config.SIMULATOR.AGENT_0.SENSORS
         self.config.freeze()
-        
+
         self.world_size = self.config.GPU_NUMBERS
         self.local_rank = self.config.local_rank
-        torch.cuda.set_device(self.device)
-        if self.world_size > 1:
-            distr.init_process_group(backend='nccl', init_method='env://',timeout=datetime.timedelta(seconds=7200000))
-            self.device = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.defrost()
-            self.config.TORCH_GPU_ID = self.config.TORCH_GPU_IDS[self.local_rank]
-            self.config.freeze()
+        self.device = bind_trainer_device(self.config)
+        self.prompt = self.prompt.to(self.device)
 
         self.traj = self.collect_infer_traj()
 
@@ -862,22 +874,25 @@ class RLTrainer(BaseVLNCETrainer):
             self.inst_ids = tmp_inst_dict
 
 
-        if self.config.MODEL.task_type == "r2r":
-            with open(self.config.INFERENCE.PREDICTIONS_FILE, "w") as f:
-                json.dump(self.path_eps, f, indent=2)
-            logger.info(f"Predictions saved to: {self.config.INFERENCE.PREDICTIONS_FILE}")
-        else:  # use 'rxr' format for rxr-habitat leaderboard
-            preds = []
-            for k,v in self.path_eps.items():
-                # save only positions that changed
-                path = [v[0]["position"]]
-                for p in v[1:]:
-                    if p["position"] != path[-1]: path.append(p["position"])
-                preds.append({"instruction_id": self.inst_ids[k], "path": path})
-            preds.sort(key=lambda x: x["instruction_id"])
-            with jsonlines.open(self.config.INFERENCE.PREDICTIONS_FILE, mode="w") as writer:
-                writer.write_all(preds)
-            logger.info(f"Predictions saved to: {self.config.INFERENCE.PREDICTIONS_FILE}")
+        if is_main_process():
+            if self.config.MODEL.task_type == "r2r":
+                with open(self.config.INFERENCE.PREDICTIONS_FILE, "w") as f:
+                    json.dump(self.path_eps, f, indent=2)
+                logger.info(f"Predictions saved to: {self.config.INFERENCE.PREDICTIONS_FILE}")
+            else:  # use 'rxr' format for rxr-habitat leaderboard
+                preds = []
+                for k,v in self.path_eps.items():
+                    # save only positions that changed
+                    path = [v[0]["position"]]
+                    for p in v[1:]:
+                        if p["position"] != path[-1]: path.append(p["position"])
+                    preds.append({"instruction_id": self.inst_ids[k], "path": path})
+                preds.sort(key=lambda x: x["instruction_id"])
+                with jsonlines.open(self.config.INFERENCE.PREDICTIONS_FILE, mode="w") as writer:
+                    writer.write_all(preds)
+                logger.info(f"Predictions saved to: {self.config.INFERENCE.PREDICTIONS_FILE}")
+
+        destroy_process_group()
 
     def get_pos_ori(self):
         pos_ori = self.envs.call(['get_pos_ori']*self.envs.num_envs)
@@ -1015,7 +1030,7 @@ class RLTrainer(BaseVLNCETrainer):
 
         map_config={'hfov':hfov,'vfov':vfov,'global_dim':(512,512),'grid_dim':(192,192),'heatmap_size':192,'cell_size':0.05,'img_segm_size':(128,128),'spatial_labels':3,'object_labels':27,'img_size':[256,256],'occupancy_height_thresh':-1.0,'norm_depth':True}
         # 3d info
-        xs, ys = torch.tensor(np.array(np.meshgrid(np.linspace(-1,1,map_config['img_size'][0]), np.linspace(1,-1,map_config['img_size'][1]))), device='cuda')
+        xs, ys = torch.tensor(np.array(np.meshgrid(np.linspace(-1,1,map_config['img_size'][0]), np.linspace(1,-1,map_config['img_size'][1]))), device=self.device)
 
         xs = xs.reshape(1,map_config['img_size'][0],map_config['img_size'][1])
         ys = ys.reshape(1,map_config['img_size'][0],map_config['img_size'][1])
@@ -1037,15 +1052,13 @@ class RLTrainer(BaseVLNCETrainer):
         positions = [None for b in range(self.batch_size)]
         headings = [None for b in range(self.batch_size)]
 
-        policy_net = self.policy.net
-        if hasattr(self.policy.net, 'module'):
-            policy_net = self.policy.net.module
+        policy_net = unwrap_module(self.policy.net)
 
-        loss_im = torch.tensor(0.0, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu')
-        loss_ob = torch.tensor(0.0, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu')
-        loss_action = torch.tensor(0.0, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu')
-        loss_prob = torch.tensor(0.0, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu')
-        loss_ac_im = torch.tensor(0.0, dtype=torch.float32, device='cuda' if torch.cuda.is_available() else 'cpu')
+        loss_im = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        loss_ob = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        loss_action = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        loss_prob = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        loss_ac_im = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         head_path = []
         real_obser_seq = []
         im_obser_seq = []
@@ -1117,7 +1130,9 @@ class RLTrainer(BaseVLNCETrainer):
                         ################
 
                         viz_img = img
-                        new_position = torch.tensor(positions[b])
+                        new_position = torch.tensor(
+                            positions[b], device=self.device, dtype=torch.float32
+                        )
 
                         img = torch.tensor(img).to(self.device)
                         
@@ -1339,7 +1354,9 @@ class RLTrainer(BaseVLNCETrainer):
                 )
 
             
-            prev_position = torch.tensor(origin_position)
+            prev_position = torch.tensor(
+                origin_position, device=self.device, dtype=torch.float32
+            )
             delta_pos = new_position - prev_position
 
             
@@ -1377,7 +1394,7 @@ class RLTrainer(BaseVLNCETrainer):
                 real_obser_tensor = torch.stack(real_obser_seq, dim=0)   # (T, D)
 
 
-            pred_cur_position = new_position.unsqueeze(0) + wm_outputs.to('cpu') # 
+            pred_cur_position = new_position.unsqueeze(0) + wm_outputs.to(self.device)
             pred_cur_position = pred_cur_position.squeeze(0)
 
             posterior = {
@@ -1429,12 +1446,8 @@ class RLTrainer(BaseVLNCETrainer):
                     gt_path_1 = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float)
                     # find the nearest real point
                  
-                    gt_path_tensor = torch.from_numpy(gt_path_1)  # 
-                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                    
-                    gt_path_tensor = gt_path_tensor.to(device)  #
-                    current_coord = new_position.unsqueeze(0)
-                    current_coord = current_coord.to(device)
+                    gt_path_tensor = torch.from_numpy(gt_path_1).to(self.device)
+                    current_coord = new_position.unsqueeze(0).to(self.device)
                     nearest_coord, nearest_index, distance = self.find_nearest_coord_torch(current_coord, gt_path_tensor) # Find the nearest ground truth coordinate to the predicted current position
 		    # This ensures the predicted next location aligns with the true trajectory to avoid drifting off-path.
 
@@ -1493,7 +1506,7 @@ class RLTrainer(BaseVLNCETrainer):
 
 
                         # ---------------- Position rollout ----------------
-                        cur_position = new_position.unsqueeze(0) + imagine_outputs
+                        cur_position = new_position.unsqueeze(0).to(self.device) + imagine_outputs
                         cur_position = cur_position.squeeze(0)
 
                         if nearest_coord is not None:
@@ -1560,16 +1573,15 @@ class RLTrainer(BaseVLNCETrainer):
                                 real_segment = real_obser[stepk-4:stepk-3]
                                 im_segment = im_obser[2*stepk-8:2*stepk-7]
                                 ob_dtw_distance = fastdtw(im_segment, real_segment, dist=NDTW.euclidean_distance)[0] # NDTW-based regulation for reconstructed visual embedding
-                                ob_dtw_distance_tensor = torch.tensor(ob_dtw_distance, device='cuda' if torch.cuda.is_available() else 'cpu')  
+                                ob_dtw_distance_tensor = torch.tensor(ob_dtw_distance, device=self.device)  
                                 ndtw_ob = torch.exp(-ob_dtw_distance_tensor / (LEN * 3.))
                                 # loss_ob += 1- ndtw_ob
                                 loss_ob += torch.tensor(1.0, device=ndtw_ob.device) - ndtw_ob 
                         
 
-                        cur_position = new_position.unsqueeze(0) + imagine_outputs.to('cpu')
-                        # imagine_outputs.clone().detach().requires_grad_(True).cpu() # torch.tensor(imagine_outputs).cpu()
+                        cur_position = new_position.unsqueeze(0) + imagine_outputs
                         cur_position = cur_position.squeeze(0)
-                        nearest_coord = nearest_coord.to('cpu')
+                        nearest_coord = nearest_coord.to(self.device)
 
                         if nearest_coord is not None:#-----------------------------
                             loss_ac_im += self.action_loss(cur_position.float(), nearest_coord.float())#-------------
@@ -1585,7 +1597,7 @@ class RLTrainer(BaseVLNCETrainer):
                         im_path = np.vstack([p.detach().cpu().numpy() for p in imagine_path])
 
                         dtw_distance = fastdtw(im_path, gt_path_1, dist=NDTW.euclidean_distance)[0] # NDTW-based regulation for action sequnece
-                        dtw_distance_tensor = torch.tensor(dtw_distance, device='cuda' if torch.cuda.is_available() else 'cpu')  #
+                        dtw_distance_tensor = torch.tensor(dtw_distance, device=self.device)  #
                         ndtw = torch.exp(-dtw_distance_tensor / (len(gt_path_1) * 3.))
                         vis_embeds = enhanced_pano_embeds[:, :768]
                         combined_pano = enhanced_pano_embeds

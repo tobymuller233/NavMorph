@@ -106,6 +106,29 @@ Inspired by human cognition, we present NavMorph, a self-evolving world model fr
    bash run_r2r/main.bash train # (run_rxr/main.bash)
    ```
 
+### Multi-GPU training / evaluation (DDP)
+
+   Each rank runs one Habitat simulator on its GPU. `TORCH_GPU_IDS` and `SIMULATOR_GPU_IDS` are **logical** indices within `CUDA_VISIBLE_DEVICES` (typically `[0,1,...,N-1]`).
+
+   **Train (example: 2 GPUs):**
+   ```bash
+   NPROC=2 CUDA_VISIBLE_DEVICES=0,1 bash run_r2r/run_train_ddp.sh --exp_name my_ddp
+   ```
+
+   Override config via extra `run.py` opts, e.g. smoke:
+   ```bash
+   NPROC=2 CUDA_VISIBLE_DEVICES=0,1 bash run_r2r/run_train_ddp.sh \
+     IL.iters 2 IL.log_every 1
+   ```
+
+   **Eval `val_unseen` (episodes sharded across ranks, metrics on rank 0):**
+   ```bash
+   NPROC=2 CUDA_VISIBLE_DEVICES=0,1 CKPT=data/checkpoints/ckpt.pth bash run_r2r/run_eval_ddp.sh
+   tail -f log/eval_ddp_latest.log
+   ```
+
+   Template config: [`run_r2r/iter_train_ddp.yaml`](run_r2r/iter_train_ddp.yaml). Training wraps only `vln_bert` in DDP (the trainable block); checkpoints are saved on rank 0 without `module.` prefixes for single-GPU eval. Multi-node: set `MASTER_ADDR` / `MASTER_PORT` and launch `torchrun` on each node (same as standard PyTorch DDP).
+
 ### Online Evaluation on R2R-CE / RxR-CE
 
    Use pseudo interative demonstrator to equip the model with our NavMorph:
